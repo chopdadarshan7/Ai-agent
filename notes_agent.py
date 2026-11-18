@@ -101,7 +101,7 @@ def transcribe_audio_batch(audio_path: str) -> str:
 
 def transcribe_audio_fast(audio_path: str) -> str:
     """
-    Transcribes short audio/video files (<30s) instantly in ~1-2 seconds
+    Transcribes short audio/video files instantly in ~1-2 seconds
     using Sarvam AI's synchronous speech-to-text API.
     """
     sarvam_key = os.getenv("SARVAM_API_KEY")
@@ -110,17 +110,21 @@ def transcribe_audio_fast(audio_path: str) -> str:
 
     clean_audio_path = audio_path
     temp_conv_dir = None
-    ext = os.path.splitext(audio_path)[1].lower()
 
-    if ext in (".mp4", ".mov", ".mkv", ".avi", ".webm"):
+    # Try fast ffmpeg conversion to 16kHz mono WAV, with fallback to direct audio_path
+    try:
         temp_conv_dir = tempfile.mkdtemp(prefix="sarvam_sync_")
-        clean_audio_path = os.path.join(temp_conv_dir, "audio.wav")
+        wav_path = os.path.join(temp_conv_dir, "audio.wav")
         cmd = [
             FFMPEG_BIN, "-y", "-i", audio_path,
-            "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-            clean_audio_path
+            "-vn", "-ar", "16000", "-ac", "1",
+            wav_path
         ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
+            clean_audio_path = wav_path
+    except Exception:
+        clean_audio_path = audio_path
 
     try:
         client = SarvamAI(api_subscription_key=sarvam_key)

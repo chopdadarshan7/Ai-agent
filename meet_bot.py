@@ -88,14 +88,15 @@ AUDIO_INTERCEPTION_SCRIPT = """
             const source = ctx.createMediaStreamSource(stream);
             source.connect(dest);
             console.log('[MeetAudio] Connected audio track to mixer. Tracks count:', tracks.length);
-            startAudioRecorder();
+            triggerAudioSlice();
         } catch(err) {
             console.warn('[MeetAudio] Error hooking stream:', err);
         }
     }
 
-    function startAudioRecorder() {
-        if (meetingRecorder && meetingRecorder.state === 'recording') return;
+    let isSlicing = false;
+    function triggerAudioSlice() {
+        if (isSlicing) return;
         const { dest } = getAudioMixer();
         if (!dest || !dest.stream || dest.stream.getAudioTracks().length === 0) return;
 
@@ -104,27 +105,47 @@ AUDIO_INTERCEPTION_SCRIPT = """
                 ? 'audio/webm;codecs=opus'
                 : 'audio/webm';
 
-            meetingRecorder = new MediaRecorder(dest.stream, { mimeType: mimeType });
-            
-            meetingRecorder.ondataavailable = (event) => {
-                if (event.data && event.data.size > 700) {
-                    const reader = new FileReader();
-                    reader.onloadend = () => {
-                        const b64 = reader.result.split(',')[1];
-                        if (b64 && window.__onMeetingAudioChunk) {
-                            window.__onMeetingAudioChunk(b64);
-                        }
-                    };
-                    reader.readAsDataURL(event.data);
+            const recorder = new MediaRecorder(dest.stream, { mimeType: mimeType });
+            const chunks = [];
+
+            recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) {
+                    chunks.push(e.data);
                 }
             };
 
-            meetingRecorder.start(1200); // Ultra-fast 1.2-second streaming audio slices
-            console.log('[MeetAudio] MediaRecorder active (1.2s ultra-fast stream)!');
-        } catch(err) {
-            console.warn('[MeetAudio] Failed to start MediaRecorder:', err);
+            recorder.onstop = () => {
+                isSlicing = false;
+                if (chunks.length > 0) {
+                    const blob = new Blob(chunks, { type: mimeType });
+                    if (blob.size > 700) {
+                        const reader = new FileReader();
+                        reader.onloadend = () => {
+                            const b64 = reader.result.split(',')[1];
+                            if (b64 && window.__onMeetingAudioChunk) {
+                                window.__onMeetingAudioChunk(b64);
+                            }
+                        };
+                        reader.readAsDataURL(blob);
+                    }
+                }
+            };
+
+            isSlicing = true;
+            recorder.start();
+            setTimeout(() => {
+                try {
+                    if (recorder.state === 'recording') recorder.stop();
+                } catch(err) {
+                    isSlicing = false;
+                }
+            }, 2000); // 2-second standalone audio clip with complete EBML headers
+        } catch(e) {
+            isSlicing = false;
         }
     }
+
+    setInterval(triggerAudioSlice, 2200);
 
     // 1. Hook RTCPeerConnection track event (WebRTC incoming audio)
     const OrigRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
@@ -171,7 +192,7 @@ AUDIO_INTERCEPTION_SCRIPT = """
                 hookStream(el.srcObject);
             }
         });
-        startAudioRecorder();
+        triggerAudioSlice();
     }, 1500);
 })();
 """
