@@ -169,152 +169,111 @@ AUDIO_INTERCEPTION_SCRIPT = """
         }
     } catch(e) {}
 
-    // Detect who is actively speaking in Google Meet
-    window.__knownParticipants = new Map();
-    window.__lastActiveSpeaker = "";
-    window.__lastSpeakerTime = 0;
-
-    function getCleanParticipantName(raw) {
-        if (!raw) return "";
-        let clean = raw.trim();
-        const lower = clean.toLowerCase();
-        if (lower.includes('bot') || lower.includes('notetaker')) return "";
-        for (const [norm, full] of window.__knownParticipants.entries()) {
-            if (norm.startsWith(lower.replace('...', '')) || lower.startsWith(norm)) {
-                return full;
-            }
-        }
-        return clean;
+    function isValidName(name) {
+        if (!name || typeof name !== 'string') return false;
+        name = name.trim();
+        if (name.length < 2 || name.length > 40) return false;
+        const lower = name.toLowerCase();
+        const blacklist = [
+            'you', 'bot', 'notetaker', 'ai notetaker', 'ai notetaker bot',
+            'pin', 'unpin', 'mute', 'unmute', 'turn off', 'turn on',
+            'camera', 'microphone', 'more options', 'leave call',
+            'participant', 'participants', 'meeting details', 'chat',
+            'raise hand', 'people', 'info', 'activities', 'fullscreen',
+            'presentation', 'presenting', 'share', 'closed captions',
+            'mic_off', 'videocam', 'videocam_off', 'volume_up', 'volume_off'
+        ];
+        if (blacklist.some(b => lower === b || lower === b + ' (you)')) return false;
+        return true;
     }
 
+    function extractNameFromTile(tile) {
+        if (!tile) return null;
+
+        // 1. Check Pin or Options button aria-label (Always contains full clean participant name)
+        const btns = tile.querySelectorAll('button[aria-label], button[data-tooltip]');
+        for (const btn of btns) {
+            const aria = btn.getAttribute('aria-label') || btn.getAttribute('data-tooltip') || '';
+            const m = aria.match(/Pin\\s+(.+?)\\s+to/i) || aria.match(/options for\\s+(.+)/i) || aria.match(/for\\s+(.+)/i);
+            if (m && m[1]) {
+                const cand = m[1].replace(/\\(you\\)/i, '').trim();
+                if (isValidName(cand)) return cand;
+            }
+        }
+
+        // 2. Check Google Meet's tile name element classes
+        const nameEls = tile.querySelectorAll(
+            'span.zWGUib, div.poVWob, div.XEazBc, div.jxFHg, [data-self-name], ' +
+            'span[class*="name" i], div[class*="name" i], span[class*="label" i], ' +
+            'div[class*="title" i], span[class*="title" i], div.VfPpkd-Bz112c-LgbsSe'
+        );
+        for (const el of nameEls) {
+            const t = (el.getAttribute('data-self-name') || el.innerText || el.textContent || '').replace(/\\(you\\)/i, '').trim();
+            if (isValidName(t)) return t;
+        }
+
+        // 3. Fallback: Parse inner text lines inside tile
+        const lines = (tile.innerText || '').split('\\n').map(s => s.replace(/\\(you\\)/i, '').trim()).filter(s => s.length > 0);
+        for (const line of lines) {
+            if (isValidName(line)) return line;
+        }
+
+        return null;
+    }
+
+    // Detect who is actively speaking in Google Meet
     function detectCurrentSpeaker() {
         try {
-            let activeSpeaker = "";
-            const now = Date.now();
-            const unmutedParticipants = [];
-            const allParticipants = [];
-
-            // 1. Check People / Participants Panel (Most accurate & untruncated names)
-            const listItems = document.querySelectorAll('div[role="listitem"], div[data-participant-id]');
-            listItems.forEach(item => {
-                const nameEl = item.querySelector('.zWGUib, .notranslate, [class*="name" i], [data-self-name]');
-                if (nameEl) {
-                    const fullName = (nameEl.getAttribute('data-self-name') || nameEl.innerText || nameEl.textContent || '').trim();
-                    if (fullName && !fullName.toLowerCase().includes('bot') && !fullName.toLowerCase().includes('notetaker') && fullName.length <= 40) {
-                        const norm = fullName.toLowerCase();
-                        window.__knownParticipants.set(norm, fullName);
-                        if (!allParticipants.includes(fullName)) allParticipants.push(fullName);
-
-                        // Check if speaking indicator is active in people row
-                        const isSpeaking = !!(
-                            item.querySelector('[aria-label*="speaking" i], svg[aria-label*="speaking" i]') ||
-                            item.querySelector('[aria-label*="talking" i], svg[aria-label*="talking" i]') ||
-                            item.querySelector('[class*="speaking" i]')
-                        );
-                        if (isSpeaking && !activeSpeaker) {
-                            activeSpeaker = fullName;
-                        }
-
-                        // Check if muted
-                        const isMuted = !!(
-                            item.querySelector('[aria-label*="muted" i], [data-is-muted="true"]') ||
-                            item.querySelector('i:has-text("mic_off"), [class*="mic-off" i]')
-                        );
-                        if (!isMuted && !unmutedParticipants.includes(fullName)) {
-                            unmutedParticipants.push(fullName);
-                        }
-                    }
-                }
-            });
-
-            // 2. Check Video / Avatar tiles on screen
-            const tiles = document.querySelectorAll(
+            const tiles = Array.from(document.querySelectorAll(
                 'div[data-participant-id], ' +
                 'div[data-requested-participant-id], ' +
-                'div[data-allocation-index], ' +
-                'div[jscontroller][data-participant-id]'
-            );
+                'div[data-allocation-id], ' +
+                'div[role="listitem"]'
+            ));
 
-            tiles.forEach(tile => {
-                let tileName = "";
-                const nameEl = tile.querySelector(
-                    'span.zWGUib, div.notranslate, span.notranslate, [data-self-name], ' +
-                    'span[class*="name" i], div[class*="name" i], div.YVvGBb, span.j10fbc'
+            // Strategy 1: Find tile with active speaking indicator (animation, speaking attribute, or blue border)
+            for (const tile of tiles) {
+                const isSpeakingAttr = tile.getAttribute('data-is-speaking') === 'true' ||
+                                       tile.matches('[aria-label*="speaking" i], [aria-label*="talking" i]');
+
+                const hasSpeakingIcon = !!tile.querySelector(
+                    '[data-is-speaking="true"], ' +
+                    'div[aria-label*="speaking" i], ' +
+                    'div.g3P7ic, div.kssM4, ' +
+                    'svg[class*="speaking" i], div[class*="speaking" i], ' +
+                    'div[class*="audio-wave" i], div[class*="volume" i]'
                 );
-                if (nameEl) {
-                    tileName = (nameEl.getAttribute('data-self-name') || nameEl.innerText || nameEl.textContent || '').trim();
+
+                const cs = window.getComputedStyle(tile);
+                const isBorderHighlighted = cs && (
+                    cs.borderColor.includes('26, 115, 232') ||
+                    cs.boxShadow.includes('26, 115, 232') ||
+                    cs.outlineColor.includes('26, 115, 232')
+                );
+
+                if (isSpeakingAttr || hasSpeakingIcon || isBorderHighlighted) {
+                    const name = extractNameFromTile(tile);
+                    if (name) return name;
                 }
-                if (!tileName) {
-                    const lines = (tile.innerText || '').split('\n').map(l => l.trim()).filter(l => l.length >= 2 && l.length <= 40);
-                    for (const l of lines) {
-                        if (!l.toLowerCase().includes('bot') && !l.toLowerCase().includes('notetaker') && !l.includes(':') && !l.includes('(')) {
-                            tileName = l;
-                            break;
-                        }
-                    }
-                }
+            }
 
-                tileName = getCleanParticipantName(tileName);
-
-                if (tileName && tileName.length >= 2 && tileName.length <= 40) {
-                    if (!allParticipants.includes(tileName)) allParticipants.push(tileName);
-
-                    // Check if tile has active speaking indicator (green tile, wave icon, data-is-speaking)
-                    const isTileSpeaking = !!(
-                        tile.getAttribute('data-is-speaking') === 'true' ||
-                        tile.querySelector('[data-is-speaking="true"]') ||
-                        tile.querySelector('div[aria-label*="speaking" i], svg[aria-label*="speaking" i]') ||
-                        tile.querySelector('div[aria-label*="talking" i], svg[aria-label*="talking" i]') ||
-                        tile.querySelector('[class*="speaking" i]') ||
-                        (tile.querySelector('svg:not([aria-label*="muted" i]):not([aria-label*="off" i])') &&
-                         !tile.querySelector('[aria-label*="muted" i], [data-is-muted="true"]'))
-                    );
-
-                    if (isTileSpeaking && !activeSpeaker) {
-                        activeSpeaker = tileName;
-                    }
-
-                    // Check if tile is unmuted
-                    const isMuted = !!(
-                        tile.querySelector('[aria-label*="muted" i], [data-is-muted="true"]') ||
-                        tile.querySelector('i:has-text("mic_off"), [class*="mic-off" i]')
-                    );
-                    if (!isMuted && !unmutedParticipants.includes(tileName)) {
-                        unmutedParticipants.push(tileName);
-                    }
-                }
+            // Strategy 2: If only one participant tile is unmuted
+            const unmutedTiles = tiles.filter(tile => {
+                const hasMicOff = !!tile.querySelector(
+                    'i:has-text("mic_off"), span:has-text("mic_off"), [aria-label*="muted" i], [data-tooltip*="muted" i]'
+                );
+                return !hasMicOff;
             });
-
-            // Priority 1: Explicitly active speaking indicator
-            if (activeSpeaker) {
-                window.__lastActiveSpeaker = activeSpeaker;
-                window.__lastSpeakerTime = now;
-                return activeSpeaker;
+            if (unmutedTiles.length === 1) {
+                const name = extractNameFromTile(unmutedTiles[0]);
+                if (name) return name;
             }
 
-            // Priority 2: Exactly one participant is unmuted in the call
-            if (unmutedParticipants.length === 1) {
-                activeSpeaker = unmutedParticipants[0];
-                window.__lastActiveSpeaker = activeSpeaker;
-                window.__lastSpeakerTime = now;
-                return activeSpeaker;
+            // Strategy 3: Check all participant tiles for names
+            for (const tile of tiles) {
+                const name = extractNameFromTile(tile);
+                if (name) return name;
             }
-
-            // Priority 3: Continuation of recent speech (within 4s)
-            if (window.__lastActiveSpeaker && (now - window.__lastSpeakerTime) < 4000) {
-                return window.__lastActiveSpeaker;
-            }
-
-            // Priority 4: If only 1 remote participant is present
-            if (allParticipants.length === 1) {
-                return allParticipants[0];
-            }
-
-            // Priority 5: Fallbacks
-            if (unmutedParticipants.length > 0) return unmutedParticipants[0];
-            if (window.__lastActiveSpeaker) return window.__lastActiveSpeaker;
-            if (allParticipants.length > 0) return allParticipants[0];
-
         } catch(e) {}
         return "Participant";
     }
@@ -458,17 +417,21 @@ class GoogleMeetBot:
 
     def get_speaker_info(self, raw_speaker: str):
         raw_speaker = (raw_speaker or "").strip()
+        # Filter out generic labels
         if not raw_speaker or raw_speaker.lower() in ("speaker", "meeting", "unknown", "participant"):
-            for p in self.speaker_map.keys():
-                if p.lower() not in ("speaker 1", "participant", "unknown", "speaker"):
-                    return self.speaker_map[p], p
             if not self.speaker_map:
-                self.speaker_map["Speaker 1"] = "Speaker 1"
+                return "Speaker 1", "Speaker 1"
+            # If known actual participants are in the call, pick the most relevant one
+            named_participants = [n for n in self.speaker_map if n.lower() not in ("speaker 1", "speaker 2", "participant", "unknown")]
+            if named_participants:
+                chosen = named_participants[-1]
+                return self.speaker_map[chosen], chosen
             return "Speaker 1", "Speaker 1"
 
         if raw_speaker not in self.speaker_map:
             assigned_id = f"Speaker {len(self.speaker_map) + 1}"
             self.speaker_map[raw_speaker] = assigned_id
+
         return self.speaker_map[raw_speaker], raw_speaker
 
     def stop(self):
@@ -528,12 +491,11 @@ class GoogleMeetBot:
                 lang = detect_text_language(text)
                 speaker_id, speaker_name = self.get_speaker_info(speaker_raw)
 
-                # Clearly display the actual participant's name without generic tags
-                if speaker_name and speaker_name.lower() not in ("participant", "unknown", "speaker"):
+                # Prioritize real participant name (e.g. "Om Nakum", "Chopda Darshan", "rgsrgs")
+                if speaker_name and speaker_name.lower() not in ("participant", "speaker", "unknown"):
                     display_speaker = speaker_name
                 else:
-                    display_speaker = speaker_id or "Participant"
-
+                    display_speaker = speaker_id
                 entry = f"[{timestamp}] {display_speaker} ({lang}): {text}"
 
                 # Avoid duplicate sentences
@@ -792,22 +754,7 @@ class GoogleMeetBot:
                 except Exception as e:
                     print(f"[Meeting Bot Audio Start Notice] {e}")
 
-                # 2. Open People panel to ensure full participant names are loaded in DOM
-                try:
-                    people_btn = self.page.locator(
-                        'button[aria-label*="Show everyone" i], '
-                        'button[data-tooltip*="Show everyone" i], '
-                        'button[aria-label*="people" i], '
-                        'button[data-panel-id="1"]'
-                    ).first
-                    if people_btn.is_visible(timeout=1500):
-                        people_btn.click(force=True)
-                        print("[Meeting Bot] 👥 Opened People panel for real-time participant names.")
-                        time.sleep(0.3)
-                except Exception:
-                    pass
-
-                # 3. Activate Captions as complementary fast-path
+                # 2. Activate Captions as complementary fast-path
                 ensure_captions_on()
                 time.sleep(0.5)
 
@@ -907,6 +854,35 @@ class GoogleMeetBot:
                         break
 
                     elapsed = int(time.time() - start_time)
+
+                    # Discover & sync meeting participants roster from Google Meet
+                    if elapsed > 0 and elapsed % 4 == 0:
+                        try:
+                            roster = self.page.evaluate("""() => {
+                                const names = [];
+                                const tiles = document.querySelectorAll(
+                                    'div[data-participant-id], div[data-requested-participant-id], div[role="listitem"]'
+                                );
+                                tiles.forEach(t => {
+                                    const btns = t.querySelectorAll('button[aria-label], button[data-tooltip]');
+                                    for (const b of btns) {
+                                        const aria = b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || '';
+                                        const m = aria.match(/Pin\\s+(.+?)\\s+to/i) || aria.match(/options for\\s+(.+)/i);
+                                        if (m && m[1]) {
+                                            const n = m[1].replace(/\\(you\\)/i, '').trim();
+                                            if (n && n.length > 1 && !names.includes(n)) names.push(n);
+                                        }
+                                    }
+                                });
+                                return names;
+                            }""")
+                            if roster and isinstance(roster, list):
+                                for p_name in roster:
+                                    if p_name not in self.speaker_map:
+                                        self.get_speaker_info(p_name)
+                        except Exception:
+                            pass
+
                     # Check captions state periodically only if not active
                     if elapsed > 0 and elapsed % 5 == 0 and not is_captions_active():
                         try:
