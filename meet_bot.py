@@ -468,7 +468,8 @@ class GoogleMeetBot:
                     "--disable-web-security",
                     "--allow-running-insecure-content",
                     "--window-size=1280,800",
-                    "--start-maximized"
+                    "--start-maximized",
+                    "--lang=en-US"
                 ]
             )
 
@@ -613,7 +614,7 @@ class GoogleMeetBot:
                 if on_status_callback:
                     on_status_callback("joining", "Clicking 'Ask to join'. Please click 'Admit' inside your Google Meet call!")
 
-                join_btn = self.page.locator('button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join")').first
+                join_btn = self.page.locator('button[jsname="Qx7uuf"], button:has-text("Ask to join"), button:has-text("Join now"), button:has-text("Join"), button:has-text("જોડાવા"), button:has-text("शामिल")').first
                 if join_btn.is_visible(timeout=4000):
                     join_btn.click()
                     time.sleep(1)
@@ -623,7 +624,15 @@ class GoogleMeetBot:
                     on_status_callback("waiting_admit", "Waiting for host to click 'Admit' in Google Meet...")
 
                 # STRICT CHECK: Wait until "Leave call" button appears (proves we are INSIDE the call)
-                leave_call_btn = self.page.locator('button[aria-label*="Leave call" i], button[data-tooltip*="Leave call" i]').first
+                leave_call_btn = self.page.locator(
+                    'button[jsname="CQylAd"], '
+                    'button[aria-label*="Leave call" i], '
+                    'button[data-tooltip*="Leave call" i], '
+                    'button:has(i:has-text("call_end")), '
+                    'button:has(span:has-text("call_end")), '
+                    'button[aria-label*="કૉલ" i], '
+                    'button[aria-label*="कॉल" i]'
+                ).first
                 leave_call_btn.wait_for(state="visible", timeout=300000)
 
                 self.in_call = True
