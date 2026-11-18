@@ -58,142 +58,268 @@ SYSTEM_NOISE_PHRASES = (
 
 AUDIO_INTERCEPTION_SCRIPT = """
 (function() {
-    console.log('[MeetAudio] Audio capture script initialized');
-    let mixerCtx = null;
-    let mixerDest = null;
-    let meetingRecorder = null;
-    const hookedStreams = new WeakSet();
+    window.__hookedTrackIds = new Set();
+    window.__meetingAudioContext = null;
+    window.__meetingAudioDest = null;
+    window.__meetingAnalyser = null;
+    window.__isBotInCall = false;
 
     function getAudioMixer() {
-        if (!mixerCtx) {
-            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-            mixerCtx = new AudioContextClass();
-            mixerDest = mixerCtx.createMediaStreamDestination();
-            console.log('[MeetAudio] Created global mixer AudioContext');
-        }
-        if (mixerCtx.state === 'suspended') {
-            mixerCtx.resume();
-        }
-        return { ctx: mixerCtx, dest: mixerDest };
-    }
-
-    function hookStream(stream) {
-        if (!stream || hookedStreams.has(stream)) return;
-        const tracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
-        if (tracks.length === 0) return;
-        hookedStreams.add(stream);
-
         try {
-            const { ctx, dest } = getAudioMixer();
-            const source = ctx.createMediaStreamSource(stream);
-            source.connect(dest);
-            console.log('[MeetAudio] Connected audio track to mixer. Tracks count:', tracks.length);
-            triggerAudioSlice();
-        } catch(err) {
-            console.warn('[MeetAudio] Error hooking stream:', err);
-        }
-    }
-
-    let isSlicing = false;
-    function triggerAudioSlice() {
-        if (isSlicing) return;
-        const { dest } = getAudioMixer();
-        if (!dest || !dest.stream || dest.stream.getAudioTracks().length === 0) return;
-
-        try {
-            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                ? 'audio/webm;codecs=opus'
-                : 'audio/webm';
-
-            const recorder = new MediaRecorder(dest.stream, { mimeType: mimeType });
-            const chunks = [];
-
-            recorder.ondataavailable = (e) => {
-                if (e.data && e.data.size > 0) {
-                    chunks.push(e.data);
-                }
-            };
-
-            recorder.onstop = () => {
-                isSlicing = false;
-                if (chunks.length > 0) {
-                    const blob = new Blob(chunks, { type: mimeType });
-                    if (blob.size > 700) {
-                        const reader = new FileReader();
-                        reader.onloadend = () => {
-                            const b64 = reader.result.split(',')[1];
-                            if (b64 && window.__onMeetingAudioChunk) {
-                                window.__onMeetingAudioChunk(b64);
-                            }
-                        };
-                        reader.readAsDataURL(blob);
-                    }
-                }
-            };
-
-            isSlicing = true;
-            recorder.start();
-            setTimeout(() => {
-                try {
-                    if (recorder.state === 'recording') recorder.stop();
-                } catch(err) {
-                    isSlicing = false;
-                }
-            }, 2000); // 2-second standalone audio clip with complete EBML headers
+            if (!window.__meetingAudioContext || window.__meetingAudioContext.state === 'closed') {
+                const AC = window.AudioContext || window.webkitAudioContext;
+                window.__meetingAudioContext = new AC();
+                window.__meetingAudioDest = window.__meetingAudioContext.createMediaStreamDestination();
+                window.__meetingAnalyser = window.__meetingAudioContext.createAnalyser();
+                window.__meetingAnalyser.fftSize = 512;
+            }
+            if (window.__meetingAudioContext.state === 'suspended') {
+                window.__meetingAudioContext.resume();
+            }
         } catch(e) {
-            isSlicing = false;
+            console.warn('[MeetBot] Mixer init error:', e);
         }
+        return { 
+            ctx: window.__meetingAudioContext, 
+            dest: window.__meetingAudioDest,
+            analyser: window.__meetingAnalyser
+        };
     }
 
-    setInterval(triggerAudioSlice, 2200);
+    window.__hookAudioTrack = function(track, label) {
+        if (!track || track.kind !== 'audio' || window.__hookedTrackIds.has(track.id)) return;
+        window.__hookedTrackIds.add(track.id);
 
-    // 1. Hook RTCPeerConnection track event (WebRTC incoming audio)
-    const OrigRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-    if (OrigRTCPeerConnection) {
-        window.RTCPeerConnection = function(...args) {
-            const pc = new OrigRTCPeerConnection(...args);
-            pc.addEventListener('track', (e) => {
-                console.log('[MeetAudio] RTCPeerConnection track event:', e.track ? e.track.kind : 'unknown');
-                if (e.streams && e.streams.length > 0) {
-                    e.streams.forEach(s => hookStream(s));
-                } else if (e.track && e.track.kind === 'audio') {
-                    hookStream(new MediaStream([e.track]));
+        try {
+            const { ctx, dest, analyser } = getAudioMixer();
+            if (ctx && dest) {
+                const mediaStream = new MediaStream([track]);
+                const src = ctx.createMediaStreamSource(mediaStream);
+                src.connect(dest);
+                if (analyser) src.connect(analyser);
+                console.log('[MeetBotAudio] Hooked remote audio track (' + label + '):', track.id);
+            }
+        } catch(e) {
+            console.warn('[MeetBotAudio] Hook track error:', e);
+        }
+
+        track.addEventListener('ended', () => {
+            window.__hookedTrackIds.delete(track.id);
+        });
+    };
+
+    window.__hookAudioStream = function(stream, label) {
+        if (!stream) return;
+        try {
+            const tracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
+            tracks.forEach(tr => window.__hookAudioTrack(tr, label || 'Stream'));
+        } catch(e) {}
+    };
+
+    // 1. Intercept WebRTC RTCPeerConnection (receives all incoming remote audio)
+    try {
+        const OrigPC = window.RTCPeerConnection;
+        if (OrigPC) {
+            window.RTCPeerConnection = new Proxy(OrigPC, {
+                construct(target, args) {
+                    const pc = Reflect.construct(target, args);
+                    try {
+                        pc.addEventListener('track', (e) => {
+                            if (e.track && e.track.kind === 'audio') {
+                                window.__hookAudioTrack(e.track, 'WebRTC Track');
+                            }
+                            if (e.streams && e.streams.length > 0) {
+                                e.streams.forEach(s => window.__hookAudioStream(s, 'WebRTC Stream'));
+                            }
+                        });
+                    } catch(err) {}
+                    return pc;
                 }
             });
-            return pc;
+        }
+    } catch(e) {}
+
+    // 2. Intercept HTMLMediaElement play() and srcObject setter
+    try {
+        const origPlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function() {
+            try {
+                if (this.srcObject instanceof MediaStream) {
+                    window.__hookAudioStream(this.srcObject, 'AudioElement.play');
+                }
+            } catch(e) {}
+            return origPlay.apply(this, arguments);
         };
-        window.RTCPeerConnection.prototype = OrigRTCPeerConnection.prototype;
-        if (window.webkitRTCPeerConnection) {
-            window.webkitRTCPeerConnection = window.RTCPeerConnection;
+
+        const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+        if (srcDesc && srcDesc.set) {
+            Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+                set: function(val) {
+                    try {
+                        if (val instanceof MediaStream) {
+                            window.__hookAudioStream(val, 'AudioElement.srcObject');
+                        }
+                    } catch(e) {}
+                    return srcDesc.set.call(this, val);
+                },
+                get: function() {
+                    return srcDesc.get.call(this);
+                }
+            });
+        }
+    } catch(e) {}
+
+    // Detect who is actively speaking in Google Meet
+    function detectCurrentSpeaker() {
+        try {
+            const speakingTile = document.querySelector(
+                '[data-is-speaking="true"], ' +
+                'div[aria-label*="speaking" i], ' +
+                'div[aria-label*="is talking" i], ' +
+                'div[data-participant-id]:has(div[class*="speaking" i]), ' +
+                'div[data-participant-id]:has(svg[class*="speaking" i])'
+            );
+            if (speakingTile) {
+                const nameEl = speakingTile.querySelector(
+                    '.zs7s8d, .jxFHg, [class*="speaker" i], [class*="name" i], [data-self-name], img[alt]'
+                );
+                if (nameEl) {
+                    const name = (nameEl.getAttribute('alt') || nameEl.getAttribute('data-self-name') || nameEl.innerText || nameEl.textContent || '').trim();
+                    if (name && !name.toLowerCase().includes('bot') && !name.toLowerCase().includes('notetaker')) {
+                        return name;
+                    }
+                }
+            }
+
+            const tiles = document.querySelectorAll('div[data-participant-id], div[data-requested-participant-id]');
+            for (const tile of tiles) {
+                const nameEl = tile.querySelector('.zs7s8d, .jxFHg, [class*="name" i], img[alt]');
+                if (nameEl) {
+                    const name = (nameEl.getAttribute('alt') || nameEl.innerText || nameEl.textContent || '').trim();
+                    if (name && !name.toLowerCase().includes('bot') && !name.toLowerCase().includes('notetaker')) {
+                        return name;
+                    }
+                }
+            }
+        } catch(e) {}
+        return "Participant";
+    }
+
+    function getAverageVolume() {
+        try {
+            const { analyser } = getAudioMixer();
+            if (!analyser) return 0;
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(data);
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) {
+                sum += data[i];
+            }
+            return sum / data.length;
+        } catch(e) {
+            return 0;
         }
     }
 
-    // 2. Hook HTMLMediaElement srcObject (captures any participant audio attached to HTML audio elements)
-    const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
-    if (srcDesc && srcDesc.set) {
-        Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
-            set: function(val) {
-                if (val instanceof MediaStream) {
-                    hookStream(val);
-                }
-                return srcDesc.set.call(this, val);
-            },
-            get: function() {
-                return srcDesc.get.call(this);
-            }
-        });
-    }
+    // Master Utterance Recorder: Produces standalone, complete WebM audio files
+    window.__isRecordingLoopActive = false;
+    window.__startAudioCapture = function() {
+        if (window.__isRecordingLoopActive) return;
+        window.__isRecordingLoopActive = true;
+        window.__isBotInCall = true;
 
-    // 3. Periodic DOM element scanner (fallback for any audio/video elements in Google Meet)
+        const { ctx } = getAudioMixer();
+        if (ctx && ctx.state === 'suspended') {
+            ctx.resume();
+        }
+
+        console.log('[MeetBotAudio] Meeting live audio capture loop activated!');
+
+        function recordCycle() {
+            if (!window.__isBotInCall) {
+                window.__isRecordingLoopActive = false;
+                return;
+            }
+
+            const { ctx, dest } = getAudioMixer();
+            if (!dest || !dest.stream || dest.stream.getAudioTracks().length === 0) {
+                setTimeout(recordCycle, 1000);
+                return;
+            }
+
+            try {
+                const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : 'audio/webm';
+
+                const recorder = new MediaRecorder(dest.stream, { mimeType: mime });
+                const chunks = [];
+                let detectedSpeaker = detectCurrentSpeaker();
+                let maxVolumeSeen = 0;
+
+                const volInterval = setInterval(() => {
+                    const v = getAverageVolume();
+                    if (v > maxVolumeSeen) maxVolumeSeen = v;
+                    const curSpk = detectCurrentSpeaker();
+                    if (curSpk && curSpk !== 'Participant') {
+                        detectedSpeaker = curSpk;
+                    }
+                }, 200);
+
+                recorder.ondataavailable = (e) => {
+                    if (e.data && e.data.size > 0) {
+                        chunks.push(e.data);
+                    }
+                };
+
+                recorder.onstop = () => {
+                    clearInterval(volInterval);
+                    if (chunks.length > 0 && window.__onMeetingAudioChunk) {
+                        const blob = new Blob(chunks, { type: mime });
+                        // Only process if sound was detected
+                        if (blob.size > 2500 && maxVolumeSeen > 1.5) {
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                const b64 = reader.result.split(',')[1];
+                                if (b64 && window.__onMeetingAudioChunk) {
+                                    window.__onMeetingAudioChunk(detectedSpeaker, b64);
+                                }
+                            };
+                            reader.readAsDataURL(blob);
+                        }
+                    }
+
+                    if (window.__isBotInCall) {
+                        setTimeout(recordCycle, 100);
+                    }
+                };
+
+                recorder.start();
+                // 3.5-second utterance recording cycle
+                setTimeout(() => {
+                    if (recorder.state === 'recording') {
+                        recorder.stop();
+                    }
+                }, 3500);
+
+            } catch(e) {
+                console.warn('[MeetBotAudio] Record cycle error:', e);
+                setTimeout(recordCycle, 2000);
+            }
+        }
+
+        recordCycle();
+    };
+
+    // Periodic scanner to catch audio elements
     setInterval(() => {
         getAudioMixer();
         document.querySelectorAll('audio, video').forEach(el => {
             if (el.srcObject instanceof MediaStream) {
-                hookStream(el.srcObject);
+                window.__hookAudioStream(el.srcObject, 'PeriodicScanner');
             }
         });
-        triggerAudioSlice();
-    }, 1500);
+    }, 2000);
 })();
 """
 
@@ -319,30 +445,39 @@ class GoogleMeetBot:
             def handle_live_caption(speaker, text):
                 process_utterance(speaker, text, is_update=False)
 
-            def handle_audio_chunk(b64_data):
+            def handle_audio_chunk(*args):
+                if len(args) == 2:
+                    speaker, b64_data = args[0], args[1]
+                elif len(args) == 1:
+                    speaker, b64_data = "Participant", args[0]
+                else:
+                    return
+
                 self.audio_active = True
                 try:
                     raw_bytes = base64.b64decode(b64_data)
-                    if len(raw_bytes) < 600:
+                    if len(raw_bytes) < 2500:
                         return
-                    print(f"[Meeting Bot Audio] Received audio chunk ({len(raw_bytes)} bytes). Transcribing...")
                     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tf:
                         tf.write(raw_bytes)
                         chunk_path = tf.name
                     try:
+                        print(f"[Meeting Bot Audio] 🎙️ Processing speech audio chunk ({len(raw_bytes)} bytes) from '{speaker}'...")
                         txt = transcribe_audio_fast(chunk_path)
                         txt = (txt or "").strip()
-                        if txt and len(txt) > 1:
+                        if txt and len(txt) > 2:
                             lower_t = txt.lower()
                             if any(p in lower_t for p in ["thank you", "subtitles by", "amara.org", "subscribe"]):
                                 return
-                            print(f"🎙️ [Audio STT Speech] {txt}")
-                            process_utterance("Speaker", txt)
+                            print(f"[Meeting Bot Audio] ✅ Transcribed speech ({speaker}): {txt}")
+                            process_utterance(speaker or "Participant", txt)
+                    except Exception as err:
+                        print(f"[Meeting Bot Audio STT Notice] {err}")
                     finally:
                         if os.path.exists(chunk_path):
                             os.remove(chunk_path)
                 except Exception as e:
-                    print(f"[Meeting Bot Audio Error] {e}")
+                    print(f"[Meeting Bot Audio Notice] {e}")
 
             try:
                 self.page.expose_function("onCaptionCaptured", handle_live_caption)
@@ -358,6 +493,9 @@ class GoogleMeetBot:
                 self.page.add_init_script(AUDIO_INTERCEPTION_SCRIPT)
             except Exception:
                 pass
+
+            self.page.on("console", lambda msg: print(f"[Browser Console] {msg.type}: {msg.text}"))
+            self.page.on("pageerror", lambda err: print(f"[Browser PageError] {err}"))
 
             try:
                 print(f"[Meeting Bot] Navigating to Google Meet room...")
@@ -424,14 +562,12 @@ class GoogleMeetBot:
                     except Exception:
                         return False
 
-                caption_attempts = 0
+                captions_enabled = False
                 def ensure_captions_on():
-                    nonlocal caption_attempts
-                    if is_captions_active():
+                    nonlocal captions_enabled
+                    if captions_enabled or is_captions_active():
+                        captions_enabled = True
                         return True
-                    if caption_attempts >= 3:
-                        return False
-                    caption_attempts += 1
 
                     # 1. Dismiss any blocking dialogs/popups (e.g. "Add others", "Your meeting is ready", "Got it")
                     try:
@@ -463,6 +599,7 @@ class GoogleMeetBot:
                             prs = (cc.get_attribute("aria-pressed") or "").lower()
                             if "turn off" not in lbl and prs != "true":
                                 cc.click(force=True)
+                                captions_enabled = True
                                 print("[Meeting Bot] ✅ Clicked toolbar 'Turn on captions' button.")
                                 time.sleep(0.5)
                                 return True
@@ -495,6 +632,7 @@ class GoogleMeetBot:
                                 txt = (cap.inner_text() or "").lower()
                                 if "turn off" not in txt and "બંધ" not in txt:
                                     cap.click(force=True)
+                                    captions_enabled = True
                                     print("[Meeting Bot] ✅ Clicked 'Turn on captions' in More Options menu!")
                                     time.sleep(0.5)
                                     return True
@@ -503,9 +641,10 @@ class GoogleMeetBot:
                     except Exception:
                         pass
 
-                    # 5. Direct keyboard shortcut 'c'
+                    # 5. Direct keyboard shortcut 'c' (only once if not active)
                     try:
                         self.page.keyboard.press("c")
+                        captions_enabled = True
                         print("[Meeting Bot] ⌨️ Sent 'c' keyboard shortcut for captions.")
                         time.sleep(0.3)
                     except Exception:
@@ -522,78 +661,22 @@ class GoogleMeetBot:
 
                     return is_captions_active()
 
-                # Activate captions initially
+                # 1. Activate Live Audio Capture immediately
+                try:
+                    self.page.mouse.click(200, 200)
+                    self.page.evaluate("() => { if (window.__startAudioCapture) window.__startAudioCapture(); }")
+                    print("[Meeting Bot] 🎙️ Direct WebRTC meeting audio capture started!")
+                except Exception as e:
+                    print(f"[Meeting Bot Audio Start Notice] {e}")
+
+                # 2. Activate Captions as complementary fast-path
                 ensure_captions_on()
                 time.sleep(0.5)
 
                 print(f"[Meeting Bot] 🔴 Live listening active! Capturing conversation...")
 
-                # Inject WebRTC Audio Capture, MutationObserver, CC enabler, and caption extractor
+                # Inject CC extractor and observer
                 self.page.evaluate("""() => {
-                    // 1. Audio stream capture from meeting participants
-                    let audioCtx = null;
-                    let audioDest = null;
-                    let meetingRecorder = null;
-                    const hookedElements = new WeakSet();
-
-                    function setupMeetingAudioCapture() {
-                        try {
-                            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-                            if (!audioCtx) {
-                                audioCtx = new AudioContextClass();
-                                audioDest = audioCtx.createMediaStreamDestination();
-                            }
-                            if (audioCtx.state === 'suspended') {
-                                audioCtx.resume();
-                            }
-
-                            const audioNodes = document.querySelectorAll('audio, video');
-                            audioNodes.forEach(el => {
-                                if (el.srcObject && !hookedElements.has(el)) {
-                                    hookedElements.add(el);
-                                    try {
-                                        const src = audioCtx.createMediaStreamSource(el.srcObject);
-                                        src.connect(audioDest);
-                                        console.log('[MeetBot] Connected remote participant audio stream');
-                                    } catch(e) {}
-                                }
-                            });
-
-                            if (!meetingRecorder && audioDest && audioDest.stream && audioDest.stream.getAudioTracks().length > 0) {
-                                meetingRecorder = new MediaRecorder(audioDest.stream, { mimeType: 'audio/webm;codecs=opus' });
-                                meetingRecorder.ondataavailable = async (e) => {
-                                    if (e.data && e.data.size > 2500 && window.__onMeetingAudioChunk) {
-                                        const reader = new FileReader();
-                                        reader.onloadend = () => {
-                                            const b64 = reader.result.split(',')[1];
-                                            window.__onMeetingAudioChunk(b64);
-                                        };
-                                        reader.readAsDataURL(e.data);
-                                    }
-                                };
-                                meetingRecorder.start(4000); // 4-second audio chunk
-                                console.log('[MeetBot] Started recording meeting participants audio');
-                            }
-                        } catch(e) {}
-                    }
-                    setInterval(setupMeetingAudioCapture, 2000);
-
-                    // 2. Periodic CC check
-                    function checkAndTurnOnCaptions() {
-                        const hasCaptions = document.querySelector('[role="region"][aria-label*="caption" i], div[jsname="dsTNUb"], button[aria-label*="Turn off captions" i]');
-                        if (!hasCaptions) {
-                            const buttons = Array.from(document.querySelectorAll('button, div[role="button"]'));
-                            const cc = buttons.find(b => {
-                                const l = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || '').toLowerCase();
-                                const prs = (b.getAttribute('aria-pressed') || '').toLowerCase();
-                                return (l.includes('turn on caption') || l.includes('captions (c)')) && prs !== 'true' && !l.includes('turn off');
-                            });
-                            if (cc) {
-                                cc.click();
-                            }
-                        }
-                    }
-                    setInterval(checkAndTurnOnCaptions, 3000);
                     function extractCaptions() {
                         // 1. Accessibility caption region (Universal standard)
                         const region = document.querySelector('[role="region"][aria-label*="caption" i], [role="region"][aria-label*="subtitle" i], div[jsname="dsTNUb"]');
@@ -671,8 +754,8 @@ class GoogleMeetBot:
                         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
                     } catch(e){}
 
-                    // Continuous extraction (ultra-fast 150ms)
-                    setInterval(extractCaptions, 150);
+                    // Continuous extraction
+                    setInterval(extractCaptions, 300);
                 }""")
 
                 last_live_summary_count = 0
@@ -686,6 +769,12 @@ class GoogleMeetBot:
                         break
 
                     elapsed = int(time.time() - start_time)
+                    # Check captions state periodically only if not active
+                    if elapsed > 0 and elapsed % 5 == 0 and not is_captions_active():
+                        try:
+                            ensure_captions_on()
+                        except Exception:
+                            pass
 
                     # Periodic Live Summary generation (every 50s if new transcripts arrived)
                     if elapsed > 0 and elapsed % 50 == 0:

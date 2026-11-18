@@ -362,7 +362,7 @@ HTML_PAGE = """<!DOCTYPE html>
         if (data.error) throw new Error(data.error);
 
         if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(pollBotStatus, 400);
+        pollInterval = setInterval(pollBotStatus, 1000);
       } catch (e) {
         errBox.innerText = e.message;
         errBox.style.display = 'block';
@@ -388,6 +388,15 @@ HTML_PAGE = """<!DOCTYPE html>
 
         if (data.audio_capture_active) {
           audioBadge.style.display = 'inline-block';
+        }
+
+        if (data.status === 'joining' || data.status === 'waiting_admit' || data.status === 'listening') {
+          document.getElementById('meet-result').style.display = 'block';
+          document.getElementById('start-bot-btn').style.display = 'none';
+          document.getElementById('bot-active-controls').style.display = 'block';
+          if (!pollInterval) {
+            pollInterval = setInterval(pollBotStatus, 1000);
+          }
         }
 
         if (data.status === 'joining') {
@@ -802,8 +811,9 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
-    // Initial history load
+    // Initial load
     loadMeetingsHistory();
+    pollBotStatus();
   </script>
 </body>
 </html>
