@@ -362,7 +362,7 @@ HTML_PAGE = """<!DOCTYPE html>
         if (data.error) throw new Error(data.error);
 
         if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(pollBotStatus, 1000);
+        pollInterval = setInterval(pollBotStatus, 350);
       } catch (e) {
         errBox.innerText = e.message;
         errBox.style.display = 'block';
@@ -395,7 +395,7 @@ HTML_PAGE = """<!DOCTYPE html>
           document.getElementById('start-bot-btn').style.display = 'none';
           document.getElementById('bot-active-controls').style.display = 'block';
           if (!pollInterval) {
-            pollInterval = setInterval(pollBotStatus, 1000);
+            pollInterval = setInterval(pollBotStatus, 350);
           }
         }
 
