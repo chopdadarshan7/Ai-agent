@@ -1,0 +1,16 @@
+# Environment variables (contains private API keys)
+.env
+
+# SQLite Database
+*.db
+meetings.db
+
+# Python cache & virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS artifacts
+.DS_Store
+*.log
