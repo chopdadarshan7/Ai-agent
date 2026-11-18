@@ -97,7 +97,11 @@ HTML_PAGE = """<!DOCTYPE html>
     .status-badge.joining { background: #fef9c3; color: #a16207; }
     .status-badge.waiting_admit { background: #ffedd5; color: #c2410c; }
     .status-badge.completed { background: #e0f2fe; color: #0369a1; }
-    .live-entry { padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 14px; line-height: 1.5; }
+    .live-entry { padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 14px; line-height: 1.5; animation: fadeInLive 0.25s cubic-bezier(0.16, 1, 0.3, 1); }
+    @keyframes fadeInLive {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
     .live-entry b { color: #1e40af; font-weight: 600; }
     .lang-tag { display: inline-block; background: #e0e7ff; color: #3730a3; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; margin-left: 4px; vertical-align: middle; }
     .admit-alert { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 12px; border-radius: 6px; font-size: 13px; color: #1e40af; margin-bottom: 16px; line-height: 1.5; }
@@ -173,7 +177,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <!-- 1. Live Conversation Stream -->
         <div id="meet-transcript-box" class="transcript-box">
           <h3>🎙️ Google Meet Live Conversation Stream</h3>
-          <div id="meet-transcript-output" class="result-content" style="color: #334155; max-height: 240px; overflow-y: auto; background: white; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0;">
+          <div id="meet-transcript-output" class="result-content" style="color: #334155; max-height: 240px; overflow-y: auto; background: white; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; scroll-behavior: smooth;">
             <i style="color:#94a3b8;">Bot is joining Google Meet. Conversation between participants will stream here live...</i>
           </div>
         </div>
@@ -312,6 +316,7 @@ HTML_PAGE = """<!DOCTYPE html>
     let pollInterval = null;
     let allMeetEntries = [];
     let currentMeetingId = null;
+    let renderedEntriesCount = 0;
 
     function switchTab(tab) {
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
@@ -327,6 +332,7 @@ HTML_PAGE = """<!DOCTYPE html>
     // GOOGLE MEET BOT AUTOMATION
     // ==========================================
     async function startMeetingBot() {
+      renderedEntriesCount = 0;
       const url = document.getElementById('meet-url-input').value.trim();
       const lang = document.getElementById('meet-summary-lang').value;
       const errBox = document.getElementById('meet-error');
@@ -431,9 +437,41 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         if (data.transcript && data.transcript.length > 0) {
-          allMeetEntries = data.transcript;
-          trOut.innerHTML = allMeetEntries.map(t => '<div class="live-entry">' + t + '</div>').join('');
-          trOut.scrollTop = trOut.scrollHeight;
+          const newEntries = data.transcript;
+          // Check if user is scrolled near bottom (within 80px)
+          const isNearBottom = trOut.scrollHeight - trOut.scrollTop - trOut.clientHeight < 80;
+
+          if (newEntries.length < renderedEntriesCount || renderedEntriesCount === 0) {
+            trOut.innerHTML = newEntries.map(t => '<div class="live-entry">' + t + '</div>').join('');
+            renderedEntriesCount = newEntries.length;
+            trOut.scrollTo({ top: trOut.scrollHeight, behavior: 'smooth' });
+          } else if (newEntries.length > renderedEntriesCount) {
+            // Append only newly arrived lines without wiping DOM
+            const fragment = document.createDocumentFragment();
+            for (let i = renderedEntriesCount; i < newEntries.length; i++) {
+              const div = document.createElement('div');
+              div.className = 'live-entry';
+              div.innerHTML = newEntries[i];
+              fragment.appendChild(div);
+            }
+            trOut.appendChild(fragment);
+            renderedEntriesCount = newEntries.length;
+
+            // Only smooth scroll if user hasn't scrolled up to read earlier history
+            if (isNearBottom) {
+              trOut.scrollTo({ top: trOut.scrollHeight, behavior: 'smooth' });
+            }
+          } else {
+            // If the last entry was updated in-place:
+            const lastIdx = newEntries.length - 1;
+            if (lastIdx >= 0 && trOut.lastElementChild && trOut.lastElementChild.innerHTML !== newEntries[lastIdx]) {
+              trOut.lastElementChild.innerHTML = newEntries[lastIdx];
+              if (isNearBottom) {
+                trOut.scrollTo({ top: trOut.scrollHeight, behavior: 'smooth' });
+              }
+            }
+          }
+          allMeetEntries = newEntries;
         }
 
         if (data.live_summary) {
@@ -505,6 +543,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     function clearMeetTranscript() {
       allMeetEntries = [];
+      renderedEntriesCount = 0;
       document.getElementById('meet-transcript-output').innerHTML = '<i style="color:#94a3b8;">Transcript cleared.</i>';
     }
 
