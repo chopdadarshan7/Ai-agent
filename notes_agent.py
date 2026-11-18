@@ -117,7 +117,7 @@ def transcribe_audio_fast(audio_path: str) -> str:
         clean_audio_path = os.path.join(temp_conv_dir, "audio.wav")
         cmd = [
             FFMPEG_BIN, "-y", "-i", audio_path,
-            "-vn", "-ar", "16000", "-ac", "1",
+            "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
             clean_audio_path
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)

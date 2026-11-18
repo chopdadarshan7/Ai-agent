@@ -362,7 +362,7 @@ HTML_PAGE = """<!DOCTYPE html>
         if (data.error) throw new Error(data.error);
 
         if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(pollBotStatus, 1000);
+        pollInterval = setInterval(pollBotStatus, 400);
       } catch (e) {
         errBox.innerText = e.message;
         errBox.style.display = 'block';

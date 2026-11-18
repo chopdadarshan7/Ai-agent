@@ -58,99 +58,102 @@ SYSTEM_NOISE_PHRASES = (
 
 AUDIO_INTERCEPTION_SCRIPT = """
 (function() {
-    window.__allAudioStreams = new WeakSet();
-    window.__meetingAudioContext = null;
-    window.__meetingAudioDest = null;
-    window.__meetingRecorder = null;
+    console.log('[MeetAudio] Audio capture script initialized');
+    let mixerCtx = null;
+    let mixerDest = null;
+    let meetingRecorder = null;
+    const hookedStreams = new WeakSet();
 
     function getAudioMixer() {
-        try {
-            if (!window.__meetingAudioContext) {
-                const AC = window.AudioContext || window.webkitAudioContext;
-                window.__meetingAudioContext = new AC();
-                window.__meetingAudioDest = window.__meetingAudioContext.createMediaStreamDestination();
-            }
-            if (window.__meetingAudioContext.state === 'suspended') {
-                window.__meetingAudioContext.resume();
-            }
-        } catch(e) {}
-        return { ctx: window.__meetingAudioContext, dest: window.__meetingAudioDest };
+        if (!mixerCtx) {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            mixerCtx = new AudioContextClass();
+            mixerDest = mixerCtx.createMediaStreamDestination();
+            console.log('[MeetAudio] Created global mixer AudioContext');
+        }
+        if (mixerCtx.state === 'suspended') {
+            mixerCtx.resume();
+        }
+        return { ctx: mixerCtx, dest: mixerDest };
     }
 
-    function hookAudioStream(stream) {
-        if (!stream || window.__allAudioStreams.has(stream)) return;
+    function hookStream(stream) {
+        if (!stream || hookedStreams.has(stream)) return;
         const tracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
         if (tracks.length === 0) return;
-        window.__allAudioStreams.add(stream);
+        hookedStreams.add(stream);
 
         try {
             const { ctx, dest } = getAudioMixer();
-            if (ctx && dest) {
-                const src = ctx.createMediaStreamSource(stream);
-                src.connect(dest);
-                console.log('[MeetBotAudio] Intercepted stream with', tracks.length, 'audio tracks');
-                startAudioRecorder();
-            }
-        } catch(e) {
-            console.warn('[MeetBotAudio] Hook stream error:', e);
+            const source = ctx.createMediaStreamSource(stream);
+            source.connect(dest);
+            console.log('[MeetAudio] Connected audio track to mixer. Tracks count:', tracks.length);
+            startAudioRecorder();
+        } catch(err) {
+            console.warn('[MeetAudio] Error hooking stream:', err);
         }
     }
 
     function startAudioRecorder() {
-        if (window.__meetingRecorder && window.__meetingRecorder.state === 'recording') return;
+        if (meetingRecorder && meetingRecorder.state === 'recording') return;
         const { dest } = getAudioMixer();
         if (!dest || !dest.stream || dest.stream.getAudioTracks().length === 0) return;
 
         try {
-            const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
                 ? 'audio/webm;codecs=opus'
                 : 'audio/webm';
 
-            window.__meetingRecorder = new MediaRecorder(dest.stream, { mimeType: mime });
-            window.__meetingRecorder.ondataavailable = (e) => {
-                if (e.data && e.data.size > 2500) {
+            meetingRecorder = new MediaRecorder(dest.stream, { mimeType: mimeType });
+            
+            meetingRecorder.ondataavailable = (event) => {
+                if (event.data && event.data.size > 700) {
                     const reader = new FileReader();
                     reader.onloadend = () => {
                         const b64 = reader.result.split(',')[1];
-                        if (window.__onMeetingAudioChunk && b64) {
+                        if (b64 && window.__onMeetingAudioChunk) {
                             window.__onMeetingAudioChunk(b64);
                         }
                     };
-                    reader.readAsDataURL(e.data);
+                    reader.readAsDataURL(event.data);
                 }
             };
 
-            window.__meetingRecorder.start(3500);
-            console.log('[MeetBotAudio] MediaRecorder recording participant speech!');
-        } catch(e) {
-            console.warn('[MeetBotAudio] MediaRecorder start error:', e);
+            meetingRecorder.start(1200); // Ultra-fast 1.2-second streaming audio slices
+            console.log('[MeetAudio] MediaRecorder active (1.2s ultra-fast stream)!');
+        } catch(err) {
+            console.warn('[MeetAudio] Failed to start MediaRecorder:', err);
         }
     }
 
-    // 1. Hook RTCPeerConnection for incoming WebRTC audio tracks
-    const OrigRTCPeerConnection = window.RTCPeerConnection;
+    // 1. Hook RTCPeerConnection track event (WebRTC incoming audio)
+    const OrigRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
     if (OrigRTCPeerConnection) {
         window.RTCPeerConnection = function(...args) {
             const pc = new OrigRTCPeerConnection(...args);
             pc.addEventListener('track', (e) => {
+                console.log('[MeetAudio] RTCPeerConnection track event:', e.track ? e.track.kind : 'unknown');
                 if (e.streams && e.streams.length > 0) {
-                    e.streams.forEach(s => hookAudioStream(s));
+                    e.streams.forEach(s => hookStream(s));
                 } else if (e.track && e.track.kind === 'audio') {
-                    hookAudioStream(new MediaStream([e.track]));
+                    hookStream(new MediaStream([e.track]));
                 }
             });
             return pc;
         };
         window.RTCPeerConnection.prototype = OrigRTCPeerConnection.prototype;
+        if (window.webkitRTCPeerConnection) {
+            window.webkitRTCPeerConnection = window.RTCPeerConnection;
+        }
     }
 
-    // 2. Hook HTMLMediaElement srcObject setter
+    // 2. Hook HTMLMediaElement srcObject (captures any participant audio attached to HTML audio elements)
     const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
     if (srcDesc && srcDesc.set) {
         Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
             set: function(val) {
                 if (val instanceof MediaStream) {
-                    hookAudioStream(val);
+                    hookStream(val);
                 }
                 return srcDesc.set.call(this, val);
             },
@@ -160,31 +163,16 @@ AUDIO_INTERCEPTION_SCRIPT = """
         });
     }
 
-    // 3. Hook AudioNode connect to destination
-    const origConnect = AudioNode.prototype.connect;
-    AudioNode.prototype.connect = function(destination, ...rest) {
-        try {
-            if (destination && destination === destination.context?.destination) {
-                const { dest } = getAudioMixer();
-                if (dest && this !== dest) {
-                    origConnect.call(this, dest);
-                    startAudioRecorder();
-                }
-            }
-        } catch(e) {}
-        return origConnect.call(this, destination, ...rest);
-    };
-
-    // 4. Periodic scan of DOM audio/video elements
+    // 3. Periodic DOM element scanner (fallback for any audio/video elements in Google Meet)
     setInterval(() => {
         getAudioMixer();
         document.querySelectorAll('audio, video').forEach(el => {
-            if (el.srcObject) {
-                hookAudioStream(el.srcObject);
+            if (el.srcObject instanceof MediaStream) {
+                hookStream(el.srcObject);
             }
         });
         startAudioRecorder();
-    }, 2000);
+    }, 1500);
 })();
 """
 
@@ -314,24 +302,26 @@ class GoogleMeetBot:
                 self.audio_active = True
                 try:
                     raw_bytes = base64.b64decode(b64_data)
-                    if len(raw_bytes) < 3000:
+                    if len(raw_bytes) < 600:
                         return
+                    print(f"[Meeting Bot Audio] Received audio chunk ({len(raw_bytes)} bytes). Transcribing...")
                     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tf:
                         tf.write(raw_bytes)
                         chunk_path = tf.name
                     try:
                         txt = transcribe_audio_fast(chunk_path)
                         txt = (txt or "").strip()
-                        if txt and len(txt) > 2:
+                        if txt and len(txt) > 1:
                             lower_t = txt.lower()
                             if any(p in lower_t for p in ["thank you", "subtitles by", "amara.org", "subscribe"]):
                                 return
+                            print(f"🎙️ [Audio STT Speech] {txt}")
                             process_utterance("Speaker", txt)
                     finally:
                         if os.path.exists(chunk_path):
                             os.remove(chunk_path)
                 except Exception as e:
-                    pass
+                    print(f"[Meeting Bot Audio Error] {e}")
 
             try:
                 self.page.expose_function("onCaptionCaptured", handle_live_caption)
@@ -660,8 +650,8 @@ class GoogleMeetBot:
                         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
                     } catch(e){}
 
-                    // Continuous extraction
-                    setInterval(extractCaptions, 300);
+                    // Continuous extraction (ultra-fast 150ms)
+                    setInterval(extractCaptions, 150);
                 }""")
 
                 last_live_summary_count = 0
@@ -675,12 +665,6 @@ class GoogleMeetBot:
                         break
 
                     elapsed = int(time.time() - start_time)
-                    # Every 2 seconds, ensure captions remain active
-                    if elapsed % 2 == 0:
-                        try:
-                            ensure_captions_on()
-                        except Exception:
-                            pass
 
                     # Periodic Live Summary generation (every 50s if new transcripts arrived)
                     if elapsed > 0 and elapsed % 50 == 0:
